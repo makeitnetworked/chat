@@ -1341,3 +1341,369 @@ Dynamic integrations – Azure tags, Service Tags, AKS, Entra/AD, IP-tag registr
 Security change management – Tufin jako główny mechanizm otwierania ruchu.
 
 I moim zdaniem właśnie strumień 4 jest najbardziej interesujący do zbadania, bo 1, 2 i 3 są technicznie dość klasyczne, a 5 to Tufin. Największa wartość będzie w odpowiedzi na pytanie: jak automatycznie przekształcać rzeczy typu Azure tag / AKS workload / Service Tag / identity w stabilne obiekty Palo Alto, które potem Tufin może wykorzystywać w regułach.
+
+
+
+
+
+import json
+import hcl2
+import ipaddress
+import re
+from pathlib import Path
+from datetime import datetime
+
+BASE = Path(__file__).resolve().parent
+
+config = json.loads((BASE / "config.json").read_text(encoding="utf-8-sig"))
+addresses = json.loads((BASE / "addresses.json").read_text(encoding="utf-8-sig"))
+services = json.loads((BASE / "services.json").read_text(encoding="utf-8-sig"))
+
+
+def normalize(value):
+    value = str(value).strip()
+
+    if value == "*":
+        return "any"
+
+    try:
+        return str(ipaddress.ip_network(value, strict=False))
+    except ValueError:
+        return value.lower().rstrip(".")
+
+
+# Zamiana adresu na nazwe istniejacego obiektu
+address_map = {}
+
+for name, value in addresses.items():
+    address_map[normalize(value)] = name
+
+
+def map_addresses(values):
+    result = []
+
+    for value in values:
+        normalized = normalize(value)
+        result.append(address_map.get(normalized, normalized))
+
+    return list(dict.fromkeys(result))
+
+
+# Mapa istniejacych serwisow
+# Klucz: (protokol, zestaw portow)
+service_map = {}
+
+
+def service_priority(name):
+    # Preferujemy np. tcp-443 zamiast service-https
+    return (not bool(re.fullmatch(r"(tcp|udp)-[\d-]+", name.lower())), name)
+
+
+for name, data in sorted(services.items(), key=lambda item: service_priority(item[0])):
+    protocol = data["protocol"].lower()
+    ports = data["ports"]
+
+    if isinstance(ports, str):
+        ports = ports.split(",")
+
+    ports = tuple(sorted(str(p).strip() for p in ports))
+    key = (protocol, ports)
+
+    if key not in service_map:
+        service_map[key] = name
+
+
+missing_services = {}
+
+
+def map_services(protocol, ports):
+    protocol = protocol.lower()
+    ports = [str(p).strip() for p in ports]
+
+    # Port * oznacza wszystkie porty danego protokolu
+    ports = ["1-65535" if p == "*" else p for p in ports]
+
+    key = (protocol, tuple(sorted(ports)))
+
+    if key in service_map:
+        return [service_map[key]]
+
+    result = []
+
+    for port in ports:
+        key = (protocol, (port,))
+
+        if key in service_map:
+            name = service_map[key]
+        else:
+            name = f"az-{protocol}-{port}"
+            missing_services[name] = {
+                "protocol": protocol,
+                "port": port
+            }
+
+        result.append(name)
+
+    return list(dict.fromkeys(result))
+
+
+def find_collections(node):
+    if isinstance(node, dict):
+        if "network_rules" in node and "action" in node:
+            yield node
+            return
+
+        for value in node.values():
+            yield from find_collections(value)
+
+    elif isinstance(node, list):
+        for value in node:
+            yield from find_collections(value)
+
+
+def make_rule(name, rule, action, applications, services):
+    return {
+        "name": name,
+        "source_zones": [config["source_zone"]],
+        "destination_zones": [config["destination_zone"]],
+        "source_addresses": map_addresses(rule["source_addresses"]),
+        "destination_addresses": map_addresses(rule["destination_addresses"]),
+        "applications": applications,
+        "services": services,
+        "action": action.lower(),
+        "log_end": True
+    }
+
+
+def convert_rule(rule, action):
+    protocols = [p.upper() for p in rule["protocols"]]
+    ports = rule["destination_ports"]
+    name = rule["name"]
+
+    result = []
+
+    # ICMP
+    if "ICMP" in protocols:
+        result.append(make_rule(
+            name if len(protocols) == 1 else name + "-ICMP",
+            rule, action, ["icmp"], ["any"]
+        ))
+
+    # TCP / UDP
+    for protocol in ("TCP", "UDP"):
+        if protocol in protocols:
+            mapped = map_services(protocol, ports)
+
+            result.append(make_rule(
+                name if len(protocols) == 1 else name + "-" + protocol,
+                rule, action, ["any"], mapped
+            ))
+
+    # ANY
+    if "ANY" in protocols or "*" in protocols:
+        if len(protocols) != 1 or ports != ["*"]:
+            raise ValueError(f"Nieobslugiwany ANY: {name}")
+
+        result.append(make_rule(
+            name, rule, action, ["any"], ["any"]
+        ))
+
+    supported = {"TCP", "UDP", "ICMP", "ANY", "*"}
+
+    if not set(protocols) <= supported:
+        raise ValueError(f"Nieznany protokol w {name}: {protocols}")
+
+    return result
+
+
+# Odczyt Azure tfvars
+input_path = BASE / config["input_file"]
+
+with input_path.open(encoding="utf-8-sig") as f:
+    azure = hcl2.load(f)
+
+collections = list(find_collections(azure))
+collections.sort(key=lambda c: int(c.get("priority", 0)))
+
+rules = []
+
+for collection in collections:
+    action = collection["action"]
+
+    for rule_id, rule in sorted(collection["network_rules"].items()):
+        rules.extend(convert_rule(rule, action))
+
+
+# ID kolekcji = nazwa pliku bez rozszerzenia
+collection_id = re.sub(
+    r"[^a-zA-Z0-9_-]", "_", input_path.stem
+)
+
+output = {
+    "collection_id": collection_id,
+    "device_group": config["device_group"],
+    "rules": rules,
+    "missing_services": missing_services
+}
+
+# Zapis
+panorama_dir = BASE / "panorama"
+collections_dir = panorama_dir / "collections"
+archive_dir = panorama_dir / "archive"
+
+collections_dir.mkdir(parents=True, exist_ok=True)
+archive_dir.mkdir(parents=True, exist_ok=True)
+
+timestamp = datetime.now().strftime("%d%m%y_%H%M")
+
+# Stala nazwa dla Terraforma
+active_file = collections_dir / f"{collection_id}.json"
+
+# Kopia z data i godzina
+archive_file = archive_dir / f"{collection_id}_pared_{timestamp}.json"
+
+content = json.dumps(output, indent=2, ensure_ascii=False)
+
+active_file.write_text(content, encoding="utf-8")
+archive_file.write_text(content, encoding="utf-8")
+
+print(f"Plik: {active_file.name}")
+print(f"Reguly: {len(rules)}")
+print(f"Nowe serwisy: {len(missing_services)}")
+
+
+
+terraform {
+  required_version = ">= 1.8.0"
+
+  required_providers {
+    panos = {
+      source  = "PaloAltoNetworks/panos"
+      version = "~> 2.0"
+    }
+  }
+}
+
+variable "panorama_host" {
+  type = string
+}
+
+variable "panos_api_key" {
+  type      = string
+  sensitive = true
+}
+
+provider "panos" {
+  hostname = var.panorama_host
+  api_key  = var.panos_api_key
+}
+
+locals {
+  collections = {
+    for filename in fileset("${path.module}/collections", "*.json") :
+    trimsuffix(filename, ".json") =>
+    jsondecode(file("${path.module}/collections/${filename}"))
+  }
+
+  missing_services = merge(
+    {},
+    [
+      for id, collection in local.collections : {
+        for name, service in collection.missing_services :
+        "${collection.device_group}/${name}" => {
+          name         = name
+          device_group = collection.device_group
+          protocol     = service.protocol
+          port         = service.port
+        }
+      }
+    ]...
+  )
+}
+
+# Brakujace serwisy TCP
+resource "panos_service" "tcp" {
+  for_each = {
+    for key, svc in local.missing_services :
+    key => svc if svc.protocol == "tcp"
+  }
+
+  location = {
+    device_group = {
+      name = each.value.device_group
+    }
+  }
+
+  name = each.value.name
+
+  protocol = {
+    tcp = {
+      destination_port = each.value.port
+    }
+  }
+}
+
+# Brakujace serwisy UDP
+resource "panos_service" "udp" {
+  for_each = {
+    for key, svc in local.missing_services :
+    key => svc if svc.protocol == "udp"
+  }
+
+  location = {
+    device_group = {
+      name = each.value.device_group
+    }
+  }
+
+  name = each.value.name
+
+  protocol = {
+    udp = {
+      destination_port = each.value.port
+    }
+  }
+}
+
+locals {
+  generated_service_names = merge(
+    {
+      for key, svc in panos_service.tcp :
+      key => svc.name
+    },
+    {
+      for key, svc in panos_service.udp :
+      key => svc.name
+    }
+  )
+}
+
+# Reguly Palo Alto - Post Rules
+resource "panos_security_policy_rules" "collections" {
+  for_each = local.collections
+
+  location = {
+    device_group = {
+      name     = each.value.device_group
+      rulebase = "post-rulebase"
+    }
+  }
+
+  position = {
+    where = "last"
+  }
+
+  rules = [
+    for rule in each.value.rules : merge(rule, {
+      services = [
+        for service in rule.services :
+        lookup(
+          local.generated_service_names,
+          "${each.value.device_group}/${service}",
+          service
+        )
+      ]
+    })
+  ]
+}
+
