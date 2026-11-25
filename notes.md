@@ -1737,3 +1737,241 @@ for path in (BASE / "panorama" / "collections").glob("*.json"):
     )
 
     print(f"{path.name}: pominięto {before - len(data['rules'])} reguł")
+
+
+
+
+import csv
+import json
+import re
+import ipaddress
+import shutil
+from pathlib import Path
+from datetime import datetime
+
+BASE = Path(__file__).resolve().parent
+COLLECTIONS = BASE / "panorama" / "collections"
+BACKUP = BASE / "panorama" / "filter_backup"
+BACKUP.mkdir(exist_ok=True, parents=True)
+
+addresses = json.loads((BASE / "addresses.json").read_text(encoding="utf-8-sig"))
+services = json.loads((BASE / "services.json").read_text(encoding="utf-8-sig"))
+
+
+def normalize_address(value):
+    value = str(value).strip().lower()
+
+    if value in ("*", "any"):
+        return "any"
+
+    try:
+        return str(ipaddress.ip_network(value, strict=False))
+    except ValueError:
+        return value.rstrip(".")
+
+
+# Nazwa obiektu -> rzeczywisty adres
+address_map = {
+    name.lower(): normalize_address(value)
+    for name, value in addresses.items()
+}
+
+
+def split_values(value):
+    if isinstance(value, list):
+        return [str(v).strip() for v in value]
+
+    value = str(value or "").strip()
+
+    # Format list eksportowanych z Panoramy
+    value = value.strip("[]{}")
+    return [
+        v.strip(" '\"")
+        for v in re.split(r"[,;\n\r\t]+|\s+", value)
+        if v.strip(" '\"")
+    ]
+
+
+def map_addresses(values):
+    result = set()
+
+    for value in split_values(values):
+        value = normalize_address(value)
+        result.add(address_map.get(value, value))
+
+    return tuple(sorted(result))
+
+
+def service_definition(name):
+    name = name.lower()
+
+    if name in ("any", "application-default"):
+        return (name,)
+
+    if name not in service_map:
+        return ("object", name)
+
+    data = service_map[name]
+
+    return tuple(
+        sorted(
+            (data["protocol"].lower(), str(port).strip())
+            for port in data["ports"]
+        )
+    )
+
+
+service_map = {}
+
+for name, data in services.items():
+    ports = data["ports"]
+
+    if isinstance(ports, str):
+        ports = ports.split(",")
+
+    service_map[name.lower()] = {
+        "protocol": data["protocol"],
+        "ports": ports
+    }
+
+
+def map_services(values):
+    result = set()
+
+    for value in split_values(values):
+        definition = service_definition(value)
+
+        if definition in (("any",), ("application-default",)):
+            result.add(definition)
+        elif definition and isinstance(definition[0], tuple):
+            result.update(definition)
+        else:
+            result.add(definition)
+
+    return tuple(sorted(result, key=str))
+
+
+def normalize_list(values):
+    return tuple(sorted(
+        v.lower() for v in split_values(values)
+    ))
+
+
+# Rozne nazwy kolumn w eksporcie CSV
+COLUMNS = {
+    "name": ["Name", "Rule Name"],
+    "src_zone": ["Source Zone", "From"],
+    "dst_zone": ["Destination Zone", "To"],
+    "src": ["Source Address", "Source", "Source Addresses"],
+    "dst": ["Destination Address", "Destination", "Destination Addresses"],
+    "app": ["Application", "Applications"],
+    "service": ["Service", "Services"],
+    "action": ["Action"]
+}
+
+
+def get_column(row, field):
+    normalized = {
+        str(k).strip().lower(): v
+        for k, v in row.items() if k is not None
+    }
+
+    for name in COLUMNS[field]:
+        if name.lower() in normalized:
+            return normalized[name.lower()]
+
+    raise ValueError(f"Brak kolumny CSV: {field}")
+
+
+def rule_signature(rule, panorama=False):
+    if panorama:
+        src_zone = get_column(rule, "src_zone")
+        dst_zone = get_column(rule, "dst_zone")
+        src = get_column(rule, "src")
+        dst = get_column(rule, "dst")
+        app = get_column(rule, "app")
+        service = get_column(rule, "service")
+        action = get_column(rule, "action")
+    else:
+        src_zone = rule["source_zones"]
+        dst_zone = rule["destination_zones"]
+        src = rule["source_addresses"]
+        dst = rule["destination_addresses"]
+        app = rule["applications"]
+        service = rule["services"]
+        action = rule["action"]
+
+    return (
+        normalize_list(src_zone),
+        normalize_list(dst_zone),
+        map_addresses(src),
+        map_addresses(dst),
+        normalize_list(app),
+        map_services(service),
+        str(action).strip().lower()
+    )
+
+
+# Odczyt eksportu Panoramy
+with open(BASE / "panorama_rules.csv", encoding="utf-8-sig", newline="") as f:
+    sample = f.read(4096)
+    f.seek(0)
+
+    dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+    panorama_rules = list(csv.DictReader(f, dialect=dialect))
+
+existing = {}
+
+for rule in panorama_rules:
+    signature = rule_signature(rule, panorama=True)
+    existing.setdefault(signature, []).append(
+        get_column(rule, "name")
+    )
+
+
+# Porownanie i filtrowanie
+total = 0
+removed = 0
+timestamp = datetime.now().strftime("%d%m%y_%H%M")
+
+for path in sorted(COLLECTIONS.glob("*.json")):
+    data = json.loads(path.read_text(encoding="utf-8"))
+    original = data["rules"]
+    filtered = []
+
+    shutil.copy2(
+        path,
+        BACKUP / f"{path.stem}_{timestamp}.json"
+    )
+
+    for rule in original:
+        total += 1
+        signature = rule_signature(rule)
+
+        if signature in existing:
+            removed += 1
+            print(
+                f"POMINIETO: {rule['name']} "
+                f"-> Panorama: {', '.join(existing[signature])}"
+            )
+        else:
+            filtered.append(rule)
+
+    data["rules"] = filtered
+
+    path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
+
+    print(
+        f"{path.name}: {len(original)} -> {len(filtered)}"
+    )
+
+
+print()
+print(f"Regul w Panoramie: {len(panorama_rules)}")
+print(f"Regul sprawdzonych: {total}")
+print(f"Usunietych duplikatow: {removed}")
+print(f"Pozostalych do wdrozenia: {total - removed}")
+print(f"Backup: {BACKUP}")
