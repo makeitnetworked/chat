@@ -2555,3 +2555,225 @@ def convert_application_rule(rule, action):
     if not fqdns:
         skipped_rules.append((name, "brak destination_fqdns"))
         return []
+
+
+import hashlib
+import ipaddress
+import json
+import re
+from datetime import datetime
+from pathlib import Path
+
+import hcl2
+
+BASE = Path(__file__).resolve().parent
+config = json.loads((BASE / "config.json").read_text(encoding="utf-8-sig"))
+addresses = json.loads((BASE / "addresses.json").read_text(encoding="utf-8-sig"))
+services = json.loads((BASE / "services.json").read_text(encoding="utf-8-sig"))
+
+
+def normalize(value):
+    value = str(value).strip()
+    if value in ("*", "any"):
+        return "any"
+    try:
+        return str(ipaddress.ip_network(value, strict=False))
+    except ValueError:
+        return value.lower().rstrip(".")
+
+
+# IP/FQDN -> nazwa obiektu w Panoramie
+address_map = {normalize(value): name for name, value in addresses.items()}
+
+
+def map_addresses(values):
+    return list(dict.fromkeys(
+        address_map.get(normalize(value), normalize(value)) for value in values
+    ))
+
+
+# (protokol, porty) -> nazwa istniejacego serwisu
+service_map = {}
+for name, data in sorted(services.items(), key=lambda x: (not bool(re.fullmatch(r"(tcp|udp)-[\d-]+", x[0].lower())), x[0])):
+    ports = data["ports"]
+    if isinstance(ports, str):
+        ports = ports.split(",")
+    key = (data["protocol"].lower(), tuple(sorted(str(p).strip() for p in ports)))
+    service_map.setdefault(key, name)
+
+missing_services = {}
+skipped_rules = []
+source_rule_count = 0
+
+
+def map_services(protocol, ports):
+    protocol = protocol.lower()
+    ports = ["1-65535" if str(port).strip() == "*" else str(port).strip() for port in ports]
+    key = (protocol, tuple(sorted(ports)))
+    if key in service_map:
+        return [service_map[key]]
+
+    result = []
+    for port in ports:
+        name = service_map.get((protocol, (port,)))
+        if name is None:
+            name = f"{protocol}-{port}"
+            missing_services[name] = {"protocol": protocol, "port": port}
+        result.append(name)
+    return list(dict.fromkeys(result))
+
+
+def short_name(name):
+    if len(name) <= 63:
+        return name
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+    return name[:54] + "-" + digest
+
+
+def make_rule(name, rule, action, applications, services, destinations=None):
+    if destinations is None:
+        destinations = map_addresses(
+            rule.get("destination_addresses", []) + rule.get("destination_fqdns", [])
+        )
+    return {
+        "name": short_name(name),
+        "source_zones": [config["source_zone"]],
+        "destination_zones": [config["destination_zone"]],
+        "source_addresses": map_addresses(rule.get("source_addresses", [])),
+        "destination_addresses": destinations,
+        "applications": applications,
+        "services": services,
+        "action": action.lower(),
+        "log_end": True,
+        "log_setting": "default",
+    }
+
+
+def convert_network_rule(rule, action):
+    protocols = [p.upper() for p in rule["protocols"]]
+    ports = rule["destination_ports"]
+    name = rule["name"]
+    result = []
+
+    if "ICMP" in protocols:
+        result.append(make_rule(
+            name if len(protocols) == 1 else name + "-ICMP",
+            rule, action, ["icmp"], ["any"]
+        ))
+
+    for protocol in ("TCP", "UDP"):
+        if protocol in protocols:
+            result.append(make_rule(
+                name if len(protocols) == 1 else name + "-" + protocol,
+                rule, action, ["any"], map_services(protocol, ports)
+            ))
+
+    if "ANY" in protocols or "*" in protocols:
+        if len(protocols) != 1 or ports != ["*"]:
+            raise ValueError(f"Nieobslugiwany ANY: {name}")
+        result.append(make_rule(name, rule, action, ["any"], ["any"]))
+
+    if not set(protocols) <= {"TCP", "UDP", "ICMP", "ANY", "*"}:
+        raise ValueError(f"Nieobslugiwany protokol w {name}: {protocols}")
+    return result
+
+
+def convert_application_rule(rule, action):
+    name = rule["name"]
+    fqdns = rule.get("destination_fqdns", [])
+
+    if not fqdns:
+        skipped_rules.append((name, "brak destination_fqdns"))
+        return []
+    if any("*" in fqdn for fqdn in fqdns):
+        skipped_rules.append((name, "wildcard w destination_fqdns"))
+        return []
+
+    # Nie tworzymy reguly z Destination=any, jesli nie ma obiektow FQDN
+    destinations = []
+    for fqdn in fqdns:
+        key = normalize(fqdn)
+        if key not in address_map:
+            raise ValueError(f"Brak FQDN w addresses.json: {fqdn} (regula {name})")
+        destinations.append(address_map[key])
+    destinations = list(dict.fromkeys(destinations))
+
+    result = []
+    for protocol in rule["protocols"]:
+        kind = protocol["type"].lower()
+        if kind == "https":
+            application = "ssl"
+        elif kind == "http":
+            application = "web-browsing"
+        else:
+            raise ValueError(f"Nieobslugiwany protokol aplikacyjny {kind}: {name}")
+
+        port = str(protocol["port"])
+        suffix = "-" + kind if len(rule["protocols"]) > 1 else ""
+        result.append(make_rule(
+            name + suffix, rule, action, [application],
+            map_services("tcp", [port]), destinations
+        ))
+    return result
+
+
+def find_collections(node):
+    if isinstance(node, dict):
+        if "action" in node and ("network_rules" in node or "application_rules" in node):
+            yield node
+            return
+        for value in node.values():
+            yield from find_collections(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from find_collections(value)
+
+
+input_path = BASE / config["input_file"]
+with input_path.open(encoding="utf-8-sig") as f:
+    azure = hcl2.load(f)
+
+collections = sorted(find_collections(azure), key=lambda c: int(c.get("priority", 0)))
+print(f"Znalezione kolekcje: {len(collections)}")
+
+rules = []
+for collection in collections:
+    network = collection.get("network_rules", {})
+    application = collection.get("application_rules", {})
+    print(f"Kolekcja: {collection.get('name', '?')} | Network: {len(network)} | Application: {len(application)}")
+
+    action = collection["action"]
+    for rule_id, rule in sorted(network.items()):
+        rules.extend(convert_network_rule(rule, action))
+    for rule_id, rule in sorted(application.items()):
+        rules.extend(convert_application_rule(rule, action))
+
+print(f"Wygenerowane reguly: {len(rules)}")
+print(f"Pominiete reguly aplikacyjne: {len(skipped_rules)}")
+for name, reason in skipped_rules:
+    print(f"  POMINIETO: {name} ({reason})")
+
+# Nie nadpisuj poprzedniego pliku pustym JSON-em
+if not rules:
+    raise SystemExit("Brak regul do zapisania. Istniejace pliki pozostaly bez zmian.")
+
+collection_id = re.sub(r"[^a-zA-Z0-9_-]", "_", input_path.stem)
+output = {
+    "collection_id": collection_id,
+    "device_group": config["device_group"],
+    "rules": rules,
+    "missing_services": missing_services,
+}
+
+collections_dir = BASE / "panorama" / "collections"
+archive_dir = BASE / "panorama" / "archive"
+collections_dir.mkdir(parents=True, exist_ok=True)
+archive_dir.mkdir(parents=True, exist_ok=True)
+
+timestamp = datetime.now().strftime("%d%m%y_%H%M")
+content = json.dumps(output, indent=2, ensure_ascii=False)
+(collections_dir / f"{collection_id}.json").write_text(content, encoding="utf-8")
+(archive_dir / f"{collection_id}_pared_{timestamp}.json").write_text(content, encoding="utf-8")
+
+print(f"Plik: {collection_id}.json")
+print(f"Nowe serwisy: {len(missing_services)}")
