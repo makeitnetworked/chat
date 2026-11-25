@@ -2296,3 +2296,131 @@ print(f"Zgodne Source + Destination + Service: {services_match}")
 print(f"Zgodne dodatkowo strefy: {zones_match}")
 print(f"Brak pelnego dopasowania: {len(azure) - exact}")
 print(f"Raport: {output.name}")
+
+import hashlib
+import ipaddress
+import json
+import re
+from datetime import datetime
+from pathlib import Path
+
+import hcl2
+
+BASE = Path(__file__).resolve().parent
+config = json.loads((BASE / "config.json").read_text(encoding="utf-8-sig"))
+addresses = json.loads((BASE / "addresses.json").read_text(encoding="utf-8-sig"))
+services = json.loads((BASE / "services.json").read_text(encoding="utf-8-sig"))
+
+
+def normalize(value):
+    value = str(value).strip()
+    if value in ("*", "any"):
+        return "any"
+    try:
+        return str(ipaddress.ip_network(value, strict=False))
+    except ValueError:
+        return value.lower().rstrip(".")
+
+
+# IP/FQDN -> nazwa obiektu w Panoramie
+address_map = {normalize(value): name for name, value in addresses.items()}
+
+
+def map_addresses(values):
+    return list(dict.fromkeys(
+        address_map.get(normalize(value), normalize(value)) for value in values
+    ))
+
+
+# (protokol, porty) -> nazwa istniejacego serwisu
+service_map = {}
+for name, data in sorted(services.items(), key=lambda x: (not bool(re.fullmatch(r"(tcp|udp)-[\d-]+", x[0].lower())), x[0])):
+    ports = data["ports"]
+    if isinstance(ports, str):
+        ports = ports.split(",")
+    key = (data["protocol"].lower(), tuple(sorted(str(p).strip() for p in ports)))
+    service_map.setdefault(key, name)
+
+missing_services = {}
+skipped_rules = []
+
+
+def map_services(protocol, ports):
+    protocol = protocol.lower()
+    ports = ["1-65535" if str(port).strip() == "*" else str(port).strip() for port in ports]
+    key = (protocol, tuple(sorted(ports)))
+    if key in service_map:
+        return [service_map[key]]
+
+    result = []
+    for port in ports:
+        name = service_map.get((protocol, (port,)))
+        if name is None:
+            name = f"{protocol}-{port}"
+            missing_services[name] = {"protocol": protocol, "port": port}
+        result.append(name)
+    return list(dict.fromkeys(result))
+
+
+def short_name(name):
+    if len(name) <= 63:
+        return name
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+    return name[:54] + "-" + digest
+
+
+def make_rule(name, rule, action, applications, services, destinations=None):
+    if destinations is None:
+        destinations = map_addresses(
+            rule.get("destination_addresses", []) + rule.get("destination_fqdns", [])
+        )
+    return {
+        "name": short_name(name),
+        "source_zones": [config["source_zone"]],
+        "destination_zones": [config["destination_zone"]],
+        "source_addresses": map_addresses(rule.get("source_addresses", [])),
+        "destination_addresses": destinations,
+        "applications": applications,
+        "services": services,
+        "action": action.lower(),
+        "log_end": True,
+        "log_setting": "default",
+    }
+
+
+def convert_network_rule(rule, action):
+    protocols = [p.upper() for p in rule["protocols"]]
+    ports = rule["destination_ports"]
+    name = rule["name"]
+    result = []
+
+    if "ICMP" in protocols:
+        result.append(make_rule(
+            name if len(protocols) == 1 else name + "-ICMP",
+            rule, action, ["icmp"], ["any"]
+        ))
+
+    for protocol in ("TCP", "UDP"):
+        if protocol in protocols:
+            result.append(make_rule(
+                name if len(protocols) == 1 else name + "-" + protocol,
+                rule, action, ["any"], map_services(protocol, ports)
+            ))
+
+    if "ANY" in protocols or "*" in protocols:
+        if len(protocols) != 1 or ports != ["*"]:
+            raise ValueError(f"Nieobslugiwany ANY: {name}")
+        result.append(make_rule(name, rule, action, ["any"], ["any"]))
+
+    if not set(protocols) <= {"TCP", "UDP", "ICMP", "ANY", "*"}:
+        raise ValueError(f"Nieobslugiwany protokol w {name}: {protocols}")
+    return result
+
+
+def convert_application_rule(rule, action):
+    name = rule["name"]
+    fqdns = rule.get("destination_fqdns", [])
+
+    if not fqdns or any("*" in fqdn for fqdn in fqdns):
+        skipped_rules.append(name)
+        return []
