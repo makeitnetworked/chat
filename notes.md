@@ -1707,3 +1707,33 @@ resource "panos_security_policy_rules" "collections" {
   ]
 }
 
+
+
+import csv
+import json
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent
+
+with open(BASE / "panorama_rules.csv", encoding="utf-8-sig") as f:
+    existing = {
+        row["Name"].strip()
+        for row in csv.DictReader(f)
+    }
+
+for path in (BASE / "panorama" / "collections").glob("*.json"):
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    before = len(data["rules"])
+
+    data["rules"] = [
+        rule for rule in data["rules"]
+        if rule["name"] not in existing
+    ]
+
+    path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
+
+    print(f"{path.name}: pominięto {before - len(data['rules'])} reguł")
