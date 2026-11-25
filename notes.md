@@ -2777,3 +2777,42 @@ content = json.dumps(output, indent=2, ensure_ascii=False)
 
 print(f"Plik: {collection_id}.json")
 print(f"Nowe serwisy: {len(missing_services)}")
+
+
+
+
+
+@'
+import csv
+import json
+from pathlib import Path
+
+with open("panorama_rules.csv", encoding="utf-8-sig", newline="") as f:
+    existing = {r["Name"].strip() for r in csv.DictReader(f)}
+
+for path in Path("panorama/collections").glob("*.json"):
+    data = json.loads(path.read_text(encoding="utf-8"))
+    duplicates = [r["name"] for r in data["rules"] if r["name"] in existing]
+
+    print(f"{path.name}: {len(duplicates)} duplikatow")
+    for name in duplicates:
+        print("  ", name)
+'@ | python -
+
+
+
+@'
+import json
+from pathlib import Path
+from collections import Counter
+
+names = []
+
+for path in Path("panorama/collections").glob("*.json"):
+    data = json.loads(path.read_text(encoding="utf-8"))
+    names.extend(r["name"] for r in data["rules"])
+
+for name, count in Counter(names).items():
+    if count > 1:
+        print(count, name)
+'@ | python -
