@@ -1975,3 +1975,324 @@ print(f"Regul sprawdzonych: {total}")
 print(f"Usunietych duplikatow: {removed}")
 print(f"Pozostalych do wdrozenia: {total - removed}")
 print(f"Backup: {BACKUP}")
+
+
+
+
+import csv
+import json
+import re
+import ipaddress
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent
+COLLECTIONS = BASE / "panorama" / "collections"
+
+addresses = json.loads(
+    (BASE / "addresses.json").read_text(encoding="utf-8-sig")
+)
+services = json.loads(
+    (BASE / "services.json").read_text(encoding="utf-8-sig")
+)
+
+
+def split_values(value):
+    if isinstance(value, list):
+        return [str(x).strip() for x in value]
+
+    value = str(value or "").strip(" []{}'\"")
+
+    return [
+        x.strip(" '\"")
+        for x in re.split(r"[,;\n\r]+", value)
+        if x.strip(" '\"")
+    ]
+
+
+def normalize_address(value):
+    value = str(value).strip().lower()
+
+    if value in ("*", "any"):
+        return "any"
+
+    try:
+        return str(ipaddress.ip_network(value, strict=False))
+    except ValueError:
+        return value.rstrip(".")
+
+
+# Odwzorowanie nazw obiektow na rzeczywiste adresy
+address_map = {
+    name.lower(): normalize_address(value)
+    for name, value in addresses.items()
+}
+
+
+def address_values(value):
+    return set(
+        address_map.get(
+            x.lower(), normalize_address(x)
+        )
+        for x in split_values(value)
+    )
+
+
+def normalize_ports(value):
+    result = []
+
+    for port in split_values(value):
+        port = port.replace(" ", "")
+        result.append(port)
+
+    return result
+
+
+# Nazwa obiektu serwisowego -> protokol/port
+service_map = {}
+
+for name, data in services.items():
+    service_map[name.lower()] = {
+        "protocol": data["protocol"].lower(),
+        "ports": normalize_ports(data["ports"])
+    }
+
+
+def service_values(value):
+    result = set()
+
+    for name in split_values(value):
+        name = name.lower()
+
+        if name in ("any", "application-default"):
+            result.add(name)
+            continue
+
+        if name in service_map:
+            service = service_map[name]
+
+            for port in service["ports"]:
+                result.add(
+                    f"{service['protocol']}/{port}"
+                )
+            continue
+
+        # Obiekty wygenerowane przez parser:
+        # tcp-443, udp-53, az-tcp-8080
+        match = re.fullmatch(
+            r"(?:az-)?(tcp|udp)-(\d+(?:-\d+)?)",
+            name
+        )
+
+        if match:
+            result.add(f"{match.group(1)}/{match.group(2)}")
+        else:
+            result.add(name)
+
+    return result
+
+
+def normal_values(value):
+    return set(
+        x.lower() for x in split_values(value)
+    )
+
+
+# Rozne nazwy kolumn eksportu Panoramy
+COLUMNS = {
+    "name": ["Name", "Rule Name"],
+    "src_zone": ["Source Zone", "From"],
+    "dst_zone": ["Destination Zone", "To"],
+    "src": ["Source Address", "Source", "Source Addresses"],
+    "dst": ["Destination Address", "Destination", "Destination Addresses"],
+    "app": ["Application", "Applications"],
+    "service": ["Service", "Services"],
+    "action": ["Action"]
+}
+
+
+def get_column(row, field):
+    columns = {
+        str(key).strip().lower(): value
+        for key, value in row.items()
+        if key is not None
+    }
+
+    for name in COLUMNS[field]:
+        if name.lower() in columns:
+            return columns[name.lower()]
+
+    raise ValueError(f"Brak kolumny w CSV: {field}")
+
+
+def normalize_rule(rule, panorama=False):
+    if panorama:
+        values = {
+            field: get_column(rule, field)
+            for field in COLUMNS
+        }
+    else:
+        values = {
+            "name": rule["name"],
+            "src_zone": rule["source_zones"],
+            "dst_zone": rule["destination_zones"],
+            "src": rule["source_addresses"],
+            "dst": rule["destination_addresses"],
+            "app": rule["applications"],
+            "service": rule["services"],
+            "action": rule["action"]
+        }
+
+    return {
+        "name": values["name"],
+        "src": address_values(values["src"]),
+        "dst": address_values(values["dst"]),
+        "service": service_values(values["service"]),
+        "src_zone": normal_values(values["src_zone"]),
+        "dst_zone": normal_values(values["dst_zone"]),
+        "app": normal_values(values["app"]),
+        "action": str(values["action"]).strip().lower()
+    }
+
+
+# Wczytanie eksportu Panoramy
+with open(BASE / "panorama_rules.csv", encoding="utf-8-sig", newline="") as f:
+    sample = f.read(4096)
+    f.seek(0)
+    dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+    panorama_raw = list(csv.DictReader(f, dialect=dialect))
+
+panorama = [
+    normalize_rule(rule, panorama=True)
+    for rule in panorama_raw
+]
+
+
+# Wczytanie wszystkich wygenerowanych kolekcji
+azure = []
+
+for path in sorted(COLLECTIONS.glob("*.json")):
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    for rule in data["rules"]:
+        item = normalize_rule(rule)
+        item["collection"] = path.name
+        azure.append(item)
+
+
+# Pola do porownywania
+FIELDS = [
+    "src",
+    "dst",
+    "service",
+    "src_zone",
+    "dst_zone",
+    "app",
+    "action"
+]
+
+
+def compare(a, b):
+    return [
+        field for field in FIELDS
+        if a[field] == b[field]
+    ]
+
+
+def format_value(value):
+    if isinstance(value, set):
+        return ", ".join(sorted(value))
+    return str(value)
+
+
+report = []
+exact = 0
+addresses_match = 0
+services_match = 0
+zones_match = 0
+
+print(f"Reguly Panorama: {len(panorama)}")
+print(f"Reguly Azure JSON: {len(azure)}")
+print("-" * 60)
+
+for rule in azure:
+    candidates = []
+
+    for existing in panorama:
+        matched = compare(rule, existing)
+        score = len(matched)
+
+        # Preferujemy zgodnosc source/destination
+        if "src" in matched and "dst" in matched:
+            score += 10
+
+        candidates.append((score, existing, matched))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    best_score, best, matched = candidates[0]
+
+    if len(matched) == len(FIELDS):
+        status = "IDENTYCZNA"
+        exact += 1
+
+    elif "src" in matched and "dst" in matched:
+        addresses_match += 1
+
+        if "service" in matched:
+            services_match += 1
+
+            if "src_zone" in matched and "dst_zone" in matched:
+                zones_match += 1
+
+        status = "CZESCIOWA"
+
+    else:
+        status = "BRAK"
+
+    different = [
+        field for field in FIELDS
+        if field not in matched
+    ]
+
+    report.append({
+        "collection": rule["collection"],
+        "azure_rule": rule["name"],
+        "panorama_rule": best["name"],
+        "status": status,
+        "matched_fields": ", ".join(matched),
+        "different_fields": ", ".join(different),
+        "azure_source": format_value(rule["src"]),
+        "panorama_source": format_value(best["src"]),
+        "azure_destination": format_value(rule["dst"]),
+        "panorama_destination": format_value(best["dst"]),
+        "azure_service": format_value(rule["service"]),
+        "panorama_service": format_value(best["service"])
+    })
+
+    if status != "BRAK":
+        print(
+            f"{status}: {rule['name']} "
+            f"-> {best['name']}"
+        )
+
+        if different:
+            print(f"  Roznice: {', '.join(different)}")
+
+
+# Raport CSV
+output = BASE / "comparison_report.csv"
+
+with output.open("w", newline="", encoding="utf-8-sig") as f:
+    writer = csv.DictWriter(f, fieldnames=report[0].keys(), delimiter=";")
+    writer.writeheader()
+    writer.writerows(report)
+
+
+print()
+print("PODSUMOWANIE")
+print(f"Identyczne reguly: {exact}")
+print(f"Zgodne Source + Destination (czesciowe): {addresses_match}")
+print(f"Zgodne Source + Destination + Service: {services_match}")
+print(f"Zgodne dodatkowo strefy: {zones_match}")
+print(f"Brak pelnego dopasowania: {len(azure) - exact}")
+print(f"Raport: {output.name}")
